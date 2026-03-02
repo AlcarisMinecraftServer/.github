@@ -47,7 +47,7 @@ jobs:
       - name: Locate JAR
         id: jar
         run: |
-          JAR_PATH=$(find build/libs -name "${{ inputs.jar_name }}" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -n 1)
+          JAR_PATH=$(find target build/libs -maxdepth 1 -name "${{ inputs.jar_name }}" ! -name "*-sources.jar" ! -name "*-javadoc.jar" 2>/dev/null | head -n 1)
           if [ -z "$JAR_PATH" ]; then
             echo "::error::JAR not found: ${{ inputs.jar_name }}"
             exit 1
