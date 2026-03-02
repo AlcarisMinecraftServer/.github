@@ -1,0 +1,147 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      jar_name:
+        type: string
+        required: true
+      plugin_name:
+        type: string
+        required: true
+      server_ids:
+        type: string
+        required: true
+    secrets:
+      PUFFERPANEL_URL:
+        required: true
+      PUFFERPANEL_CLIENT_ID:
+        required: true
+      PUFFERPANEL_CLIENT_SECRET:
+        required: true
+      DISCORD_WEBHOOK:
+        required: false
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew build -x test
+
+      - name: Locate JAR
+        id: jar
+        run: |
+          JAR_PATH=$(find build/libs -name "${{ inputs.jar_name }}" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -n 1)
+          if [ -z "$JAR_PATH" ]; then
+            echo "::error::JAR not found: ${{ inputs.jar_name }}"
+            exit 1
+          fi
+          echo "path=$JAR_PATH" >> $GITHUB_OUTPUT
+
+      - name: Fetch PufferPanel OAuth2 token
+        id: token
+        run: |
+          RESPONSE=$(curl -s -X POST "${{ secrets.PUFFERPANEL_URL }}/oauth2/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=${{ secrets.PUFFERPANEL_CLIENT_ID }}&client_secret=${{ secrets.PUFFERPANEL_CLIENT_SECRET }}")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Failed to obtain OAuth2 token"
+            echo "$RESPONSE"
+            exit 1
+          fi
+          echo "access_token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Upload & Restart per server
+        run: |
+          IFS=',' read -ra SERVERS <<< "${{ inputs.server_ids }}"
+          FAILED=()
+          TOKEN="${{ steps.token.outputs.access_token }}"
+
+          for SERVER_ID in "${SERVERS[@]}"; do
+            SERVER_ID=$(echo "$SERVER_ID" | xargs)
+            echo "→ Deploying to: $SERVER_ID"
+
+            UPLOAD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PUT "${{ secrets.PUFFERPANEL_URL }}/api/servers/$SERVER_ID/file/plugins/${{ inputs.plugin_name }}.jar" \
+              -H "Authorization: Bearer $TOKEN" \
+              -F "file=@${{ steps.jar.outputs.path }}")
+
+            if [[ "$UPLOAD_STATUS" -lt 200 || "$UPLOAD_STATUS" -ge 300 ]]; then
+              echo "::error::Upload failed for $SERVER_ID (HTTP $UPLOAD_STATUS)"
+              FAILED+=("$SERVER_ID")
+              continue
+            fi
+
+            RESTART_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST "${{ secrets.PUFFERPANEL_URL }}/api/servers/$SERVER_ID/restart" \
+              -H "Authorization: Bearer $TOKEN")
+
+            if [[ "$RESTART_STATUS" -lt 200 || "$RESTART_STATUS" -ge 300 ]]; then
+              echo "::error::Restart failed for $SERVER_ID (HTTP $RESTART_STATUS)"
+              FAILED+=("$SERVER_ID")
+              continue
+            fi
+
+            echo "✓ $SERVER_ID done"
+          done
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "::error::Failed servers: ${FAILED[*]}"
+            exit 1
+          fi
+
+      - name: Notify Discord
+        if: always() && secrets.DISCORD_WEBHOOK != ''
+        env:
+          STATUS: ${{ job.status }}
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
+          RELEASE_URL="${{ github.server_url }}/$REPO/releases/tag/$TAG"
+          SERVER_IDS="${{ inputs.server_ids }}"
+
+          if [ "$STATUS" = "success" ]; then
+            COLOR=3066993
+            TITLE="${{ inputs.plugin_name }} がサーバーに配置されました"
+            DESC="新しいバージョンのプラグインが配置され、サーバーが自動的に再起動されました。"
+          else
+            COLOR=15158332
+            TITLE="${{ inputs.plugin_name }} のデプロイに失敗しました"
+            DESC="デプロイ中にエラーが発生しました。詳細を確認してください。"
+          fi
+
+          curl -s -X POST "$WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"$TITLE\",
+                \"description\": \"$DESC\",
+                \"color\": $COLOR,
+                \"fields\": [
+                  {\"name\": \"タグ\", \"value\": \"\`$TAG\`\", \"inline\": true},
+                  {\"name\": \"リリースページ\", \"value\": \"[こちら]($RELEASE_URL)\", \"inline\": true},
+                  {\"name\": \"サーバー\", \"value\": \"\`$SERVER_IDS\`\", \"inline\": true},
+                  {\"name\": \"詳細\", \"value\": \"[Actions]($RUN_URL)\", \"inline\": true}
+                ]
+              }]
+            }"
