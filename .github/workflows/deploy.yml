@@ -1,4 +1,4 @@
-name: Deploy
+name: Deploy Minecraft Plugin
 
 on:
   workflow_call:
@@ -109,7 +109,6 @@ jobs:
           fi
 
       - name: Notify Discord
-        if: always() && secrets.DISCORD_WEBHOOK != ''
         env:
           STATUS: ${{ job.status }}
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
